@@ -62,9 +62,13 @@ Each summary the mod produces is also saved as a Markdown file under
 `$CLAUDE_CONFIG_DIR` when it is set), named by time and session id. The log
 line names the file. Use it to check what the compaction kept, to add what it
 missed, or to hand the note to another session. The files stay on your
-machine and are not cleaned up by the mod. The first line of each file is an
-HTML comment with the session, time and sizes. If the file cannot be written
-within five seconds, the compaction stands and only the file is missing.
+machine and are kept with no time limit: the mod never deletes them, unlike
+the session transcripts, which Claude Code removes after `cleanupPeriodDays`
+(30 days by default). A summary takes 10-30 KB, so even daily compactions add
+only some megabytes a year; delete old files by hand if you like. The first
+line of each file is an HTML comment with the session, time and sizes. If
+the file cannot be written within five seconds, the compaction stands and only
+the file is missing.
 
 ## Commands
 
