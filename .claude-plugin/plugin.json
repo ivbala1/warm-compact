@@ -1,0 +1,42 @@
+{
+  "name": "warm-compact",
+  "version": "0.1.0",
+  "description": "Compact a large idle session while its one-hour prompt cache is still warm",
+  "author": { "name": "Ivan Balashov" },
+  "license": "MIT",
+  "repository": "https://github.com/ivbala1/warm-compact",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "idleMinutes": {
+      "type": "number",
+      "title": "Idle minutes",
+      "description": "Minutes after the last model request before the session is compacted; keep it a few minutes under the one-hour cache",
+      "default": 52
+    },
+    "cutoffMinutes": {
+      "type": "number",
+      "title": "Cutoff minutes",
+      "description": "A timer that fires later than this many minutes after the last request (the computer slept) skips: the cache is cold already",
+      "default": 57
+    },
+    "minTokens": {
+      "type": "number",
+      "title": "Minimum context",
+      "description": "Context size in tokens below which a cold re-read is cheap and the session is left as it is",
+      "default": 200000
+    },
+    "language": {
+      "type": "string",
+      "title": "Language",
+      "description": "Language of the mod's messages and of its instructions to the summary",
+      "options": ["en", "ru"],
+      "default": "en"
+    },
+    "noteHint": {
+      "type": "string",
+      "title": "Note hint",
+      "description": "Extra text added to the summary instructions, for example what else to keep",
+      "default": ""
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "warm-compact",
+  "owner": {
+    "name": "Ivan Balashov"
+  },
+  "metadata": {
+    "description": "Compact a large idle Claude Code session while its prompt cache is still warm"
+  },
+  "plugins": [
+    {
+      "name": "warm-compact",
+      "source": "./",
+      "description": "Compact a large idle session while its one-hour prompt cache is still warm",
+      "version": "0.1.0"
+    }
+  ]
+}

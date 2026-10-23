@@ -1,0 +1,4 @@
+{
+  "description": "Compact a large idle session before its prompt cache expires",
+  "modules": ["./register.ts"]
+}
