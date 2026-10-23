@@ -7,7 +7,7 @@ import { cachePercent, clockTime, instructions, settings, t, tokens, type Config
 // mod compacts it while the cache is still warm, so the summary reads the
 // conversation at the cache price and the next return starts small.
 
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 const ARMED = { plugin: 'warm-compact', key: 'armed' } as const;
 const LOG_KEY = 'log';
 const LOG_LIMIT = 500;
