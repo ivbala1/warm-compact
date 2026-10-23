@@ -16,6 +16,10 @@ type World = {
   // Set while a /compact command waits for the test to run its turn.
   release?: () => void;
   pending?: string;
+  env?: Record<string, string>;
+  failWrite?: boolean;
+  hangWrite?: boolean;
+  messages?: unknown;
 };
 
 function fixture(on: On, initial: Partial<World> = {}) {
@@ -28,6 +32,15 @@ function fixture(on: On, initial: Partial<World> = {}) {
   const logs: string[] = [];
   const commands: { command: string; args?: string }[] = [];
   const direct: (string | undefined)[] = [];
+  const files = new Map<string, string>();
+  const env: Record<string, string> = { HOME: '/home/u', ...initial.env };
+  on('env.get', ($, e) => ({ value: env[e.name] }));
+  on('fs.write', async ($, e) => {
+    if (initial.failWrite) throw new Error('disk full');
+    if (initial.hangWrite) await new Promise(() => {});
+    files.set(e.path, e.text);
+    return { value: undefined };
+  });
   on('session.id', () => ({ value: 'test-session' }));
   on('session.usage', () => ({ value: { startedAt: NOW, context: { tokens: world.tokens, window: 1_000_000 }, rateLimits: [] } }));
   on('agent.list', () => ({ value: world.agents }));
@@ -46,7 +59,7 @@ function fixture(on: On, initial: Partial<World> = {}) {
     }
     const before = world.tokens;
     world.tokens = 20_000;
-    return { messages: SUMMARY, tokensBefore: before, tokensAfter: 15_000, usage: { input_tokens: 10, cache_read_input_tokens: 290_000, cache_creation_input_tokens: 9_990, output_tokens: 4_000 } };
+    return { messages: (world.messages ?? SUMMARY) as never, tokensBefore: before, tokensAfter: 15_000, usage: { input_tokens: 10, cache_read_input_tokens: 290_000, cache_creation_input_tokens: 9_990, output_tokens: 4_000 } };
   });
   // The /compact command waits until the test runs its turn (compactTurn).
   on('command.run', async ($, e) => {
@@ -58,10 +71,10 @@ function fixture(on: On, initial: Partial<World> = {}) {
     }
     return { text: '' };
   });
-  return { clock, world, logs, commands, direct, store };
+  return { clock, world, logs, commands, direct, store, files };
 }
 
-const SUMMARY = [{ role: 'user', text: 'summary', toolUses: [] }] as never;
+const SUMMARY = [{ role: 'user', text: 'summary', toolUses: [] }, { role: 'assistant', text: 'kept', toolUses: [] }] as never;
 
 // The /compact command as an SDK session runs it: a turn of its own around the compaction.
 type Fixture = ReturnType<typeof fixture>;
@@ -92,7 +105,7 @@ async function turn($: Engine, clock: MockClock, opts: { stepAt?: number; endAt?
 }
 
 function stored(f: Fixture) {
-  return (f.store.get('log') ?? []) as { outcome: string; reason: string; tokensBefore?: number; tokensAfter?: number; cacheShare?: number }[];
+  return (f.store.get('log') ?? []) as { outcome: string; reason: string; tokensBefore?: number; tokensAfter?: number; cacheShare?: number; summaryFile?: string }[];
 }
 
 test('desktop: compacts through /compact 52 minutes after the last request, not earlier', async ($, on) => {
@@ -261,7 +274,7 @@ test('the desktop text command is answered locally', async ($, on) => {
   on('prompt.submit', ($, e) => ({ text: e.text }));
   await $.session.start(DESKTOP);
   const reply = await $.prompt.submit({ text: '/warm-compact status', origin: { kind: 'composer' } } as never);
-  expect((reply as { drop?: string }).drop).toContain('warm-compact 0.1.0');
+  expect((reply as { drop?: string }).drop).toContain('warm-compact 0.2.0');
 });
 
 test('a turn of the person before the queued /compact skips it and arms again', async ($, on) => {
@@ -341,4 +354,99 @@ test('a /compact that waited past the cutoff skips: the cache went cold', async 
   await compactTurn($, f);
   expect(stored(f)[0]?.reason).toBe('vetoed: late: the cache went cold while waiting');
   expect(f.world.tokens).toBe(300_000);
+});
+
+test('the summary is saved to a file the log names', async ($, on) => {
+  const f = fixture(on, { surfaces: ['terminal'] });
+  await $.session.start(TERMINAL);
+  await turn($, f.clock);
+  await f.clock.advance(52 * MIN);
+  const path = '/home/u/.claude/plugins/data/warm-compact/summaries/20261023-105200000-test-session.md';
+  expect([...f.files.keys()]).toEqual([path]);
+  const text = f.files.get(path) ?? '';
+  expect(text).toContain('session test-session');
+  expect(text).toContain('300k -> 15k tokens');
+  expect(text.endsWith('summary\n')).toBe(true);
+  expect(text).not.toContain('kept');
+  expect((stored(f))[0]?.summaryFile).toBe(path);
+  expect(f.logs.at(-1)).toContain(`Summary saved: ${path}`);
+});
+
+test('CLAUDE_CONFIG_DIR moves the summaries', async ($, on) => {
+  const f = fixture(on, { surfaces: ['terminal'], env: { CLAUDE_CONFIG_DIR: '/cfg/' } });
+  await $.session.start(TERMINAL);
+  await turn($, f.clock);
+  await f.clock.advance(52 * MIN);
+  expect([...f.files.keys()][0]?.startsWith('/cfg/plugins/data/warm-compact/summaries/')).toBe(true);
+});
+
+test('a failed write keeps the compaction and its log entry', async ($, on) => {
+  const f = fixture(on, { surfaces: ['terminal'], failWrite: true });
+  await $.session.start(TERMINAL);
+  await turn($, f.clock);
+  await f.clock.advance(52 * MIN);
+  const log = stored(f);
+  expect(log[0]?.outcome).toBe('compacted');
+  expect(log[0]?.summaryFile).toBeUndefined();
+  expect(f.logs.at(-1)).not.toContain('Summary saved');
+});
+
+test('a write that never settles gives up after five seconds', async ($, on) => {
+  const f = fixture(on, { surfaces: ['terminal'], hangWrite: true });
+  await $.session.start(TERMINAL);
+  await turn($, f.clock);
+  await f.clock.advance(52 * MIN);
+  expect(stored(f)).toEqual([]);
+  await f.clock.advance(5_000);
+  const log = stored(f);
+  expect(log[0]?.outcome).toBe('compacted');
+  expect(log[0]?.summaryFile).toBeUndefined();
+});
+
+test('no file when the first message is not a summary', async ($, on) => {
+  const f = fixture(on, { surfaces: ['terminal'], messages: [{ role: 'user', text: '  ', toolUses: [] }, { role: 'assistant', text: 'kept', toolUses: [] }] });
+  await $.session.start(TERMINAL);
+  await turn($, f.clock);
+  await f.clock.advance(52 * MIN);
+  expect(f.files.size).toBe(0);
+  expect((stored(f))[0]?.outcome).toBe('compacted');
+});
+
+test('two compactions in one minute get two files', async ($, on) => {
+  const f = fixture(on, { surfaces: ['terminal'] });
+  await $.session.start(TERMINAL);
+  await command($, 'now');
+  await f.clock.advance(1000);
+  await f.clock.advance(1000);
+  await command($, 'now');
+  await f.clock.advance(1000);
+  expect(f.files.size).toBe(2);
+});
+
+test('desktop: the /compact path saves the summary too', async ($, on) => {
+  const f = fixture(on);
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  await f.clock.advance(52 * MIN);
+  await compactTurn($, f);
+  expect(f.files.size).toBe(1);
+  expect((stored(f))[0]?.summaryFile).toBe([...f.files.keys()][0]);
+});
+
+test('no home and no config dir: no file, the compaction stands', async ($, on) => {
+  const f = fixture(on, { surfaces: ['terminal'], env: { HOME: '' } });
+  await $.session.start(TERMINAL);
+  await turn($, f.clock);
+  await f.clock.advance(52 * MIN);
+  expect(f.files.size).toBe(0);
+  expect((stored(f))[0]?.outcome).toBe('compacted');
+});
+
+test('Windows: USERPROFILE with a trailing backslash', async ($, on) => {
+  const f = fixture(on, { surfaces: ['terminal'], env: { HOME: '', USERPROFILE: 'C:\\Users\\u\\' } });
+  await $.session.start(TERMINAL);
+  await turn($, f.clock);
+  await f.clock.advance(52 * MIN);
+  // The mock file system on a POSIX host resolves a Windows path against the working directory.
+  expect([...f.files.keys()][0]?.includes('C:\\Users\\u/.claude/plugins/data/warm-compact/summaries/')).toBe(true);
 });

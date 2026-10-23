@@ -1,4 +1,4 @@
-import type { EngineInterface, Register, SessionCompactResult, Timer } from 'claude-code';
+import type { EngineInterface, Register, SessionCompacted, SessionCompactResult, Timer } from 'claude-code';
 import { cachePercent, clockTime, instructions, settings, t, tokens, type Config, type MessageKey } from './text.ts';
 
 // A one-hour prompt cache lapses an hour after the last request that read or
@@ -7,7 +7,7 @@ import { cachePercent, clockTime, instructions, settings, t, tokens, type Config
 // mod compacts it while the cache is still warm, so the summary reads the
 // conversation at the cache price and the next return starts small.
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const ARMED = { plugin: 'warm-compact', key: 'armed' } as const;
 const LOG_KEY = 'log';
 const LOG_LIMIT = 500;
@@ -30,6 +30,7 @@ export type LogEntry = {
   cacheShare?: number;
   summaryInput?: number;
   summaryOutput?: number;
+  summaryFile?: string;
 };
 
 type Compacting = {
@@ -95,6 +96,49 @@ function entry(c: Pick<Compacting, 'sessionId' | 'idleMinutes' | 'manual' | 'tok
   return { sessionId: c.sessionId, at: new Date(at).toISOString(), outcome, reason, manual: c.manual, idleMinutes: c.idleMinutes, tokensBefore: c.tokensBefore };
 }
 
+// Saving the summary never holds up the compaction's result for longer than this.
+const SAVE_MS = 5_000;
+
+/** Where the summaries are kept: beside the engine's own data, one file per compaction. */
+async function summaryDir($: EngineInterface): Promise<string | undefined> {
+  const base = (await $.env.get('CLAUDE_CONFIG_DIR')) || (await home($));
+  return base && `${base.replace(/[\\/]+$/, '')}/plugins/data/warm-compact/summaries`;
+}
+
+async function home($: EngineInterface): Promise<string | undefined> {
+  const dir = (await $.env.get('HOME')) || (await $.env.get('USERPROFILE'));
+  return dir ? `${dir.replace(/[\\/]+$/, '')}/.claude` : undefined;
+}
+
+/** Keeps the summary as a file, to check or hand on later; a failure only loses the file. */
+async function saveSummary($: EngineInterface, c: Compacting, at: number, result: SessionCompacted): Promise<string | undefined> {
+  // From core the summary comes first, then the messages it kept.
+  const first = result.messages[0];
+  const summary = first?.role === 'user' ? first.text.trim() : '';
+  if (!summary) return undefined;
+  const write = async () => {
+    const dir = await summaryDir($);
+    if (!dir) return undefined;
+    const iso = new Date(at).toISOString();
+    const stamp = iso.slice(0, 23).replace(/[-:]/g, '').replace('T', '-').replace('.', '');
+    const path = `${dir}/${stamp}-${c.sessionId.replace(/[^\w-]/g, '_')}.md`;
+    const head = `<!-- warm-compact ${VERSION}: session ${c.sessionId}, ${iso}, ${c.manual ? 'manual' : 'idle'} after ${c.idleMinutes} min, ${tokens(result.tokensBefore ?? c.tokensBefore)} -> ${tokens(result.tokensAfter)} tokens -->\n\n`;
+    await $.fs.write(path, `${head}${summary}\n`);
+    return path;
+  };
+  let timeout: Timer | undefined;
+  try {
+    return await Promise.race([
+      write(),
+      new Promise<undefined>(resolve => { timeout = $.clock.after(SAVE_MS, () => resolve(undefined)); }),
+    ]);
+  } catch {
+    return undefined;
+  } finally {
+    timeout?.cancel();
+  }
+}
+
 async function finish($: EngineInterface, c: Compacting, result: SessionCompactResult | undefined, failure?: string) {
   // A late answer of an attempt given up on must not close a newer one.
   if (compacting !== c) return;
@@ -105,6 +149,7 @@ async function finish($: EngineInterface, c: Compacting, result: SessionCompactR
   if (result && result.skip === undefined) {
     const share = cachePercent(result.usage);
     const before = result.tokensBefore ?? c.tokensBefore;
+    const file = await saveSummary($, c, now, result);
     const e: LogEntry = {
       ...entry(c, now, 'compacted', c.manual ? 'manual' : 'idle'),
       tokensBefore: before,
@@ -112,9 +157,11 @@ async function finish($: EngineInterface, c: Compacting, result: SessionCompactR
       cacheShare: share,
       summaryInput: result.usage ? result.usage.input_tokens + result.usage.cache_read_input_tokens + result.usage.cache_creation_input_tokens : undefined,
       summaryOutput: result.usage?.output_tokens,
+      summaryFile: file,
     };
     const cache = share === undefined ? '' : say('cacheShare', { pct: share });
-    await record($, e, say('compacted', { time: clockTime(now), idle: c.idleMinutes, before: tokens(before), after: tokens(result.tokensAfter), cache }));
+    const saved = file ? say('summarySaved', { file }) : '';
+    await record($, e, say('compacted', { time: clockTime(now), idle: c.idleMinutes, before: tokens(before), after: tokens(result.tokensAfter), cache }) + saved);
   } else if (result) {
     await record($, entry(c, now, 'skipped', `vetoed: ${result.skip}`), say('vetoed', { reason: result.skip }));
   } else {

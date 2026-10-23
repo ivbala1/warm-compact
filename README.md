@@ -57,6 +57,15 @@ the work, with the goal, what is done, what is left and the next step, the
 files touched, decisions and permissions with their reasons, open background
 work, what was not verified, and dates. Your `noteHint` is added to the end.
 
+Each summary the mod produces is also saved as a Markdown file under
+`~/.claude/plugins/data/warm-compact/summaries/` (or under
+`$CLAUDE_CONFIG_DIR` when it is set), named by time and session id. The log
+line names the file. Use it to check what the compaction kept, to add what it
+missed, or to hand the note to another session. The files stay on your
+machine and are not cleaned up by the mod. The first line of each file is an
+HTML comment with the session, time and sizes. If the file cannot be written
+within five seconds, the compaction stands and only the file is missing.
+
 ## Commands
 
 | Command | Effect |
