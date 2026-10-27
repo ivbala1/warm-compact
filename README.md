@@ -158,6 +158,10 @@ both may run. If you want only this mod, set `"idleCompaction": false`.
 - The mod can only shorten the context, it does not make the summary
   perfect: details not written into the note may be lost, as with any
   compaction.
+- A session is compacted only after some surface has shown it once: a run
+  that never drew is taken for a headless one. A hidden session keeps the
+  mark through a plugin reload, but not through a restart of the app; it
+  is compacted again once you open it.
 
 ## Development
 

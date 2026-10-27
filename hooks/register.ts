@@ -7,8 +7,9 @@ import { cachePercent, clockTime, instructions, settings, t, tokens, type Config
 // mod compacts it while the cache is still warm, so the summary reads the
 // conversation at the cache price and the next return starts small.
 
-const VERSION = '0.2.3';
+const VERSION = '0.2.4';
 const ARMED = { plugin: 'warm-compact', key: 'armed' } as const;
+const DRAWN = { plugin: 'warm-compact', key: 'drawn' } as const;
 const LOG_KEY = 'log';
 const LOG_LIMIT = 500;
 const BUSY_AGENTS = ['pending', 'running', 'waiting'];
@@ -65,6 +66,7 @@ let working = false;
 let compacting: Compacting | undefined;
 // Whether a surface has listed this session at least once: a hidden session stays
 // armed, a headless run that never drew does not; quiet exits are kept for drawn sessions alone.
+// Kept in $.state too, so a reload while the session is hidden keeps it.
 let drawn = false;
 // The quiet exits kept since the last armed timer: each is kept once.
 const quietKept = new Set<string>();
@@ -87,6 +89,16 @@ function disarm() {
 
 function forget($: EngineInterface) {
   return $.state.set(ARMED, null).catch(() => {});
+}
+
+/** Reads whether a surface draws the session now, and keeps the first yes in $.state. */
+async function lookDrawn($: EngineInterface) {
+  if ((await $.session.surfaces()).length === 0 || drawn) return;
+  drawn = true;
+  // A failed write costs only a reload while hidden: the timer is armed all the same.
+  try {
+    await $.state.set(DRAWN, { sessionId: await $.session.id() });
+  } catch {}
 }
 
 async function isOff($: EngineInterface, sessionId: string) {
@@ -374,7 +386,7 @@ async function arm($: EngineInterface) {
   // Headless runs (-p, an SDK script, a bot) draw nowhere: leave them alone. A
   // session that drew is armed while hidden too: the desktop app lists no surface
   // for a session moved off the screen, and that is where the user leaves it idle.
-  if ((await $.session.surfaces()).length > 0) drawn = true;
+  await lookDrawn($);
   if (!drawn) return;
   const sessionId = await $.session.id();
   if (await isOff($, sessionId)) return;
@@ -483,9 +495,14 @@ export const register: Register = (on, options) => {
     const result = await next(e);
     // Not a terminal REPL: an SDK host (the desktop app) or -p, which refuse the direct call.
     direct = e.isInteractive && e.surface === 'terminal' ? undefined : false;
-    // A reload forgets the module's variables: whether the session draws is read again.
+    // A reload forgets the module's variables: whether the session draws is read
+    // again, or taken from the mark a drawn session left before it was hidden.
     try {
-      if ((await $.session.surfaces()).length) drawn = true;
+      await lookDrawn($);
+      if (!drawn) {
+        const { value } = await $.state.get(DRAWN);
+        if (value && value.sessionId === (await $.session.id())) drawn = true;
+      }
     } catch {}
     try {
       await $.command.register({ name: 'warm-compact', description: say('commandDescription'), argumentHint: 'status | now | off | on', immediate: true });
@@ -603,6 +620,7 @@ export const register: Register = (on, options) => {
     drawn = false;
     quietKept.clear();
     await forget($);
+    await $.state.set(DRAWN, null).catch(() => {});
     return next(e);
   });
 };

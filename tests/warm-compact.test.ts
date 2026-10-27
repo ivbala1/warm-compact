@@ -23,6 +23,8 @@ type World = {
   failWrite?: boolean;
   hangWrite?: boolean;
   messages?: unknown;
+  // $.state as a reload finds it: what the session wrote before the module was loaded.
+  state?: Record<string, unknown>;
 };
 
 function fixture(on: On, initial: Partial<World> = {}) {
@@ -31,6 +33,16 @@ function fixture(on: On, initial: Partial<World> = {}) {
   on('store.get', ($, e) => ({ value: store.get(e.key) }));
   on('store.set', ($, e) => { store.set(e.key, JSON.parse(JSON.stringify(e.value))); return { value: undefined }; });
   on('store.delete', ($, e) => { store.delete(e.key); return { value: undefined }; });
+  // The kit keeps $.state; the test seeds what a reload would find there, until
+  // the mod writes that key itself, and sees every write the mod makes.
+  const seeded = new Map<string, unknown>(Object.entries(initial.state ?? {}));
+  const state = new Map<string, unknown>();
+  on('state.get', ($, e, next) => (seeded.has(e.key) ? { value: { value: seeded.get(e.key), version: 1 } } : next(e)) as never);
+  on('state.set', ($, e, next) => {
+    seeded.delete(e.key);
+    state.set(e.key, JSON.parse(JSON.stringify(e.value)));
+    return next(e);
+  });
   const world: World = { tokens: 300_000, agents: [], surfaces: ['desktop'], rateLimits: [], ...initial };
   const logs: string[] = [];
   const commands: { command: string; args?: string }[] = [];
@@ -74,7 +86,7 @@ function fixture(on: On, initial: Partial<World> = {}) {
     }
     return { text: '' };
   });
-  return { clock, world, logs, commands, direct, store, files };
+  return { clock, world, logs, commands, direct, store, files, state };
 }
 
 const SUMMARY = [{ role: 'user', text: 'summary', toolUses: [] }, { role: 'assistant', text: 'kept', toolUses: [] }] as never;
@@ -374,6 +386,46 @@ test('a reload arms again for the time left', async ($, on) => {
   await compactTurn($, f);
 });
 
+test('a drawn session leaves its mark in the state, and session end clears it', async ($, on) => {
+  const f = fixture(on);
+  await $.session.start(DESKTOP);
+  expect(f.state.get('drawn')).toEqual({ sessionId: 'test-session' });
+  await $.session.end({ reason: 'clear', sessionId: 'test-session', resume: { sessionId: 'test-session' } } as never);
+  expect(f.state.get('drawn')).toBeNull();
+});
+
+test('a session first drawn at the end of a turn leaves its mark too', async ($, on) => {
+  const f = fixture(on, { surfaces: [] });
+  await $.session.start(DESKTOP);
+  expect(f.state.has('drawn')).toBe(false);
+  f.world.surfaces = ['desktop'];
+  await turn($, f.clock);
+  expect(f.state.get('drawn')).toEqual({ sessionId: 'test-session' });
+});
+
+// Each test loads a fresh module: a mark already in the state, and no surface,
+// is a reload of a session hidden at the time.
+test('a reload while hidden keeps the session armed', async ($, on) => {
+  const f = fixture(on, { surfaces: [], state: { drawn: { sessionId: 'test-session' } } });
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  await f.clock.advance(52 * MIN - 1);
+  expect(f.commands).toEqual([]);
+  await f.clock.advance(1);
+  expect(f.commands.length).toBe(1);
+  await compactTurn($, f);
+  expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['compacted', 'idle']]);
+});
+
+test('a mark of another session does not make a headless run drawn', async ($, on) => {
+  const f = fixture(on, { surfaces: [], state: { drawn: { sessionId: 'other-session' } } });
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  await f.clock.advance(120 * MIN);
+  expect(f.commands).toEqual([]);
+  expect(stored(f)).toEqual([]);
+});
+
 test('status and now answer in Russian when configured', RU, async ($, on) => {
   const f = fixture(on);
   await $.session.start(DESKTOP);
@@ -394,7 +446,7 @@ test('the desktop text command is answered locally', async ($, on) => {
   on('prompt.submit', ($, e) => ({ text: e.text }));
   await $.session.start(DESKTOP);
   const reply = await $.prompt.submit({ text: '/warm-compact status', origin: { kind: 'composer' } } as never);
-  expect((reply as { drop?: string }).drop).toContain('warm-compact 0.2.3');
+  expect((reply as { drop?: string }).drop).toContain('warm-compact 0.2.4');
 });
 
 test('a turn of the person before the queued /compact skips it and arms again', async ($, on) => {
