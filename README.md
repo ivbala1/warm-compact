@@ -121,6 +121,15 @@ under the key `log`:
   "summaryInput": 0, "summaryOutput": 0 }
 ```
 
+A record with `outcome: "noted"` marks a quiet exit that left the session
+without a timer where one was expected: a turn of the main loop that started
+before the previous one ended, a turn that ended without arming the timer, a
+timer that found a turn or another compaction under way. These go to the store
+alone, with no line in the transcript, and the same one is kept once until a
+timer is armed again. The
+expected exits are not recorded: a context under `minTokens`, the mod off in
+the session, a headless run, a turn with no model request.
+
 ## Built-in idle compaction
 
 Claude Code 2.1.290 and later has its own `idleCompaction` setting (about 54

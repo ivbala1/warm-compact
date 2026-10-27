@@ -191,10 +191,9 @@ test('a timer later than the cutoff skips: the cache is cold', async ($, on) => 
   await turn($, f.clock, { endAt: 58 * MIN });
   await f.clock.advance(MIN);
   expect(f.commands).toEqual([]);
+  // The turn ran past the idle time: the watch on it noted that first.
   const log = stored(f);
-  expect(log.length).toBe(1);
-  expect(log[0]?.outcome).toBe('skipped');
-  expect(log[0]?.reason).toBe('late');
+  expect(log.map(e => [e.outcome, e.reason])).toEqual([['noted', 'turn: a turn of the main loop has not ended after 52 min'], ['skipped', 'late']]);
 });
 
 test('running agents skip the idle period', async ($, on) => {
@@ -281,6 +280,21 @@ test('someone else compacting cancels the timer', async ($, on) => {
   expect(stored(f)).toEqual([]);
 });
 
+test('someone else compacting in the middle of a turn: the turn end arms again', async ($, on) => {
+  const f = fixture(on);
+  await $.session.start(DESKTOP);
+  await $.turn.start({ turnId: 'mid', text: 'hello' });
+  for await (const _ of $.turn.step({ turnId: 'mid', index: 0, model: 'test', messageCount: 1 })) { /* drain */ }
+  // Between two requests of one turn: the turn end reads the state when it begins, so it still arms.
+  await $.session.compact({ trigger: 'auto', messages: SUMMARY });
+  f.world.tokens = 300_000;
+  for await (const _ of $.turn.step({ turnId: 'mid', index: 1, model: 'test', messageCount: 1 })) { /* drain */ }
+  await $.turn.complete({ turnId: 'mid', answer: 'ok', durationMs: 1, isAborted: false, reason: 'answer' });
+  await f.clock.advance(52 * MIN);
+  expect(f.commands.length).toBe(1);
+  await compactTurn($, f);
+});
+
 test('/clear cancels the timer', async ($, on) => {
   const f = fixture(on);
   await $.session.start(DESKTOP);
@@ -288,6 +302,62 @@ test('/clear cancels the timer', async ($, on) => {
   await $.session.end({ reason: 'clear', sessionId: 'test-session', resume: { sessionId: 'test-session' } } as never);
   await f.clock.advance(60 * MIN);
   expect(f.commands).toEqual([]);
+});
+
+test('a turn overtaken by the next one is noted, and the next end arms', async ($, on) => {
+  const f = fixture(on);
+  await $.session.start(DESKTOP);
+  await $.turn.start({ turnId: 'a', text: 'hello' });
+  for await (const _ of $.turn.step({ turnId: 'a', index: 0, model: 'test', messageCount: 1 })) { /* drain */ }
+  // A second turn of the main loop starts before the first one ends.
+  await $.turn.start({ turnId: 'b', text: '' });
+  await $.turn.complete({ turnId: 'a', answer: 'ok', durationMs: 1, isAborted: false, reason: 'answer' });
+  await f.clock.advance(0);
+  expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['noted', 'turn.start: the previous turn of the main loop did not end']]);
+  // Nothing is shown in the session for a quiet exit.
+  expect(f.logs).toEqual([]);
+  await $.turn.complete({ turnId: 'b', answer: 'ok', durationMs: 1, isAborted: false, reason: 'answer' });
+  await f.clock.advance(52 * MIN);
+  expect(f.commands.length).toBe(1);
+  await compactTurn($, f);
+});
+
+test('a session moved off the screen is still compacted', async ($, on) => {
+  const f = fixture(on);
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  // The desktop app lists no surface for a hidden session.
+  f.world.surfaces = [];
+  await turn($, f.clock);
+  await f.clock.advance(52 * MIN - 1);
+  expect(f.commands).toEqual([]);
+  await f.clock.advance(1);
+  expect(f.commands.length).toBe(1);
+  await compactTurn($, f);
+  expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['compacted', 'idle']]);
+});
+
+test('a turn that never ends is noted once after the idle time', async ($, on) => {
+  const f = fixture(on);
+  await $.session.start(DESKTOP);
+  await $.turn.start({ turnId: 'stuck', text: '' });
+  for await (const _ of $.turn.step({ turnId: 'stuck', index: 0, model: 'test', messageCount: 1 })) { /* drain */ }
+  await f.clock.advance(52 * MIN - 1);
+  expect(stored(f)).toEqual([]);
+  await f.clock.advance(3 * HOUR);
+  expect(f.commands).toEqual([]);
+  expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['noted', 'turn: a turn of the main loop has not ended after 52 min']]);
+});
+
+test('a headless run after /clear of a drawn session is not noted', async ($, on) => {
+  const f = fixture(on);
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  await $.session.end({ reason: 'clear', sessionId: 'test-session', resume: { sessionId: 'test-session' } } as never);
+  f.world.surfaces = [];
+  await turn($, f.clock);
+  await f.clock.advance(120 * MIN);
+  expect(stored(f)).toEqual([]);
 });
 
 test('a reload arms again for the time left', async ($, on) => {
@@ -324,7 +394,7 @@ test('the desktop text command is answered locally', async ($, on) => {
   on('prompt.submit', ($, e) => ({ text: e.text }));
   await $.session.start(DESKTOP);
   const reply = await $.prompt.submit({ text: '/warm-compact status', origin: { kind: 'composer' } } as never);
-  expect((reply as { drop?: string }).drop).toContain('warm-compact 0.2.1');
+  expect((reply as { drop?: string }).drop).toContain('warm-compact 0.2.3');
 });
 
 test('a turn of the person before the queued /compact skips it and arms again', async ($, on) => {
