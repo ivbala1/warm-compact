@@ -3,6 +3,21 @@
 A mod for Claude Code that compacts a large idle session a few minutes before
 its prompt cache expires, so that coming back to it is cheap.
 
+## Why not the built-in idle compaction
+
+Claude Code 2.1.290 and later has its own `idleCompaction`. The mod differs:
+
+- **Works in the desktop app.** The built-in one runs only in a terminal; in
+  the Code tab of the Claude desktop app it never fired for us in a month.
+- **A summary made for coming back.** The note keeps the goal, the next step,
+  rejected options, exact paths, commands and numbers (see [The summary](#the-summary)).
+- **Each summary saved to a file**, so you can check what was kept or hand it
+  to another session.
+- **No compaction while the usage limit is used up**, and none after the
+  computer slept, when the cache is already cold.
+- **Under your control.** `/warm-compact now`, `off` and `on` per session, the
+  idle time and size threshold in settings, and a journal of every decision.
+
 Claude Code keeps a one-hour prompt cache. If you return to a large session
 after more than an hour, the whole context is written to the cache again at
 twice the input price, while reading it from a warm cache costs 0.1. The mod
