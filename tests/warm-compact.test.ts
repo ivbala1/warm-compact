@@ -25,6 +25,8 @@ type World = {
   messages?: unknown;
   // $.state as a reload finds it: what the session wrote before the module was loaded.
   state?: Record<string, unknown>;
+  // What the main loop's request read, as the API reports it; no usage when unset.
+  stepTokens?: number;
 };
 
 function fixture(on: On, initial: Partial<World> = {}) {
@@ -66,7 +68,10 @@ function fixture(on: On, initial: Partial<World> = {}) {
   on('session.end', ($, e) => ({ sessionId: e.sessionId }));
   on('turn.start', ($, e) => ({ turnId: e.turnId }));
   on('turn.complete', () => ({ text: '' }));
-  on('turn.step', async function* ($, e) { return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null }; });
+  on('turn.step', async function* ($, e) {
+    const usage = world.stepTokens === undefined ? null : { input_tokens: 10, cache_read_input_tokens: world.stepTokens - 10, cache_creation_input_tokens: 0, output_tokens: 100, model: 'test' };
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: usage as never };
+  });
   on('session.compact', ($, e) => {
     // A compaction outside a /compact turn is the mod's direct call.
     if (world.pending === undefined) {
@@ -165,8 +170,44 @@ test('the engine refusal of the direct call is recognised, other errors are not'
   expect(isHeadlessRefusal(new Error('a turn is running'))).toBe(false);
 });
 
-test('a headless run is left alone', async ($, on) => {
+test('a headless run is left alone, its large context noted once', async ($, on) => {
   const f = fixture(on, { surfaces: [] });
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  await f.clock.advance(120 * MIN);
+  await turn($, f.clock);
+  expect(f.commands).toEqual([]);
+  expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['noted', 'arm: no surface has drawn the session']]);
+  expect(f.logs).toEqual([]);
+});
+
+test('a headless run with a small context is not noted', async ($, on) => {
+  const f = fixture(on, { surfaces: [], tokens: 150_000 });
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  await f.clock.advance(120 * MIN);
+  expect(stored(f)).toEqual([]);
+});
+
+// Each test loads a fresh module, as a later run of the same session would.
+test('a note already last in the log is not kept again by a fresh module', async ($, on) => {
+  const f = fixture(on, { surfaces: [] });
+  f.store.set('log', [{ sessionId: 'test-session', at: iso(NOW - HOUR), outcome: 'noted', reason: 'arm: no surface has drawn the session', manual: false, idleMinutes: 0 }]);
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  expect(stored(f).length).toBe(1);
+});
+
+test('a note of another reason last in the log does not hold back a new one', async ($, on) => {
+  const f = fixture(on, { surfaces: [] });
+  f.store.set('log', [{ sessionId: 'test-session', at: iso(NOW - HOUR), outcome: 'noted', reason: 'turn.start: the previous turn of the main loop did not end', manual: false, idleMinutes: 0 }]);
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  expect(stored(f).map(e => e.reason)).toEqual(['turn.start: the previous turn of the main loop did not end', 'arm: no surface has drawn the session']);
+});
+
+test('a context under the floor is left alone', async ($, on) => {
+  const f = fixture(on, { tokens: 150_000, stepTokens: 150_000 });
   await $.session.start(DESKTOP);
   await turn($, f.clock);
   await f.clock.advance(120 * MIN);
@@ -174,13 +215,31 @@ test('a headless run is left alone', async ($, on) => {
   expect(stored(f)).toEqual([]);
 });
 
-test('a context under the floor is left alone', async ($, on) => {
-  const f = fixture(on, { tokens: 150_000 });
+test('the turn of the compaction itself is not noted for the large request before it', async ($, on) => {
+  const f = fixture(on, { stepTokens: 300_000 });
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  await f.clock.advance(52 * MIN);
+  await compactTurn($, f);
+  expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['compacted', 'idle']]);
+});
+
+test('usage() a little under the last request is not noted', async ($, on) => {
+  const f = fixture(on, { tokens: 195_000, stepTokens: 201_000 });
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  expect(stored(f)).toEqual([]);
+});
+
+test('a context that reads small after a large request is noted', async ($, on) => {
+  const f = fixture(on, { tokens: 150_000, stepTokens: 250_000 });
   await $.session.start(DESKTOP);
   await turn($, f.clock);
   await f.clock.advance(120 * MIN);
   expect(f.commands).toEqual([]);
-  expect(stored(f)).toEqual([]);
+  const log = stored(f);
+  expect(log.map(e => [e.outcome, e.reason])).toEqual([['noted', 'arm: the context reads 150000 tokens, the last request read 250000']]);
+  expect(log[0]?.tokensBefore).toBe(250_000);
 });
 
 test('a new turn cancels the timer and starts the count again', async ($, on) => {
@@ -361,7 +420,7 @@ test('a turn that never ends is noted once after the idle time', async ($, on) =
   expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['noted', 'turn: a turn of the main loop has not ended after 52 min']]);
 });
 
-test('a headless run after /clear of a drawn session is not noted', async ($, on) => {
+test('a turn after /clear of a hidden session is noted, not armed', async ($, on) => {
   const f = fixture(on);
   await $.session.start(DESKTOP);
   await turn($, f.clock);
@@ -369,7 +428,8 @@ test('a headless run after /clear of a drawn session is not noted', async ($, on
   f.world.surfaces = [];
   await turn($, f.clock);
   await f.clock.advance(120 * MIN);
-  expect(stored(f)).toEqual([]);
+  expect(f.commands).toEqual([]);
+  expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['noted', 'arm: no surface has drawn the session']]);
 });
 
 test('a reload arms again for the time left', async ($, on) => {
@@ -414,6 +474,156 @@ test('a reload while hidden keeps the session armed', async ($, on) => {
   await f.clock.advance(1);
   expect(f.commands.length).toBe(1);
   await compactTurn($, f);
+  // The reload found a large context and no timer in the state: noted, then the next turn armed.
+  expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([
+    ['noted', 'session.start: a reload found no timer to pick up for a large context'],
+    ['compacted', 'idle'],
+  ]);
+});
+
+test('a reload of a small session without a timer is not noted', async ($, on) => {
+  const f = fixture(on, { tokens: 20_000, state: { drawn: { sessionId: 'test-session' } } });
+  await $.session.start(DESKTOP);
+  expect(stored(f)).toEqual([]);
+});
+
+test('a first load of a large session without a timer is not noted', async ($, on) => {
+  const f = fixture(on);
+  await $.session.start(DESKTOP);
+  expect(stored(f)).toEqual([]);
+});
+
+// The session of 29.10.2026: a plugin reload landed as the turn ended, and the
+// new module saw the end with no request of its own.
+test('a turn that ends in a freshly reloaded module is noted', async ($, on) => {
+  const f = fixture(on, { state: { drawn: { sessionId: 'test-session' } } });
+  await $.session.start(DESKTOP);
+  await $.turn.complete({ turnId: 'old', answer: 'ok', durationMs: 1, isAborted: false, reason: 'answer' });
+  await f.clock.advance(120 * MIN);
+  expect(f.commands).toEqual([]);
+  expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([
+    ['noted', 'session.start: a reload found no timer to pick up for a large context'],
+    ['noted', 'arm: no request of the main loop seen since the module loaded'],
+  ]);
+});
+
+// The same with the turn's end kept in the state before the swap: the new module arms from it.
+test('a reload after the turn ended arms from the last request kept in the state', async ($, on) => {
+  const at = NOW - 2 * MIN;
+  const f = fixture(on, { state: { drawn: { sessionId: 'test-session' }, request: { sessionId: 'test-session', at, ended: true } } });
+  await $.session.start(DESKTOP);
+  expect(f.state.get('armed')).toEqual({ sessionId: 'test-session', lastRequestAt: at });
+  await f.clock.advance(50 * MIN - 1);
+  expect(f.commands).toEqual([]);
+  await f.clock.advance(1);
+  expect(f.commands.length).toBe(1);
+  await compactTurn($, f);
+  expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['compacted', 'idle']]);
+  // The history was replaced: nothing is left for a later reload to count from.
+  expect(f.state.get('request')).toBeNull();
+});
+
+test('a reload during a turn: its end in the new module arms from the kept request', async ($, on) => {
+  const at = NOW - 2 * MIN;
+  const f = fixture(on, { state: { drawn: { sessionId: 'test-session' }, request: { sessionId: 'test-session', at, ended: false } } });
+  await $.session.start(DESKTOP);
+  expect(f.state.has('armed')).toBe(false);
+  await $.turn.complete({ turnId: 'old', answer: 'ok', durationMs: 1, isAborted: false, reason: 'answer' });
+  await f.clock.advance(50 * MIN);
+  expect(f.commands.length).toBe(1);
+  await compactTurn($, f);
+  expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['compacted', 'idle']]);
+});
+
+test('a turn under way at a reload whose end never comes is noted at the next turn', async ($, on) => {
+  const f = fixture(on, { state: { drawn: { sessionId: 'test-session' }, request: { sessionId: 'test-session', at: NOW - 2 * MIN, ended: false } } });
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['noted', 'turn.start: the turn under way at the reload did not end in this module']]);
+  // The new turn arms as usual.
+  await f.clock.advance(52 * MIN);
+  expect(f.commands.length).toBe(1);
+});
+
+test('a reload while the mod compacts does not arm a second one', async ($, on) => {
+  const f = fixture(on);
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  await f.clock.advance(52 * MIN);
+  expect(f.commands.length).toBe(1);
+  // /compact waits in the queue; the module is reloaded meanwhile.
+  expect(f.state.get('armed')).toBeNull();
+  expect(f.state.get('request')).toBeNull();
+  await $.session.start(DESKTOP);
+  await f.clock.advance(5 * MIN);
+  expect(f.commands.length).toBe(1);
+});
+
+test('a reload after a skip does not arm past it', async ($, on) => {
+  const f = fixture(on);
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  f.world.agents = [{ id: 'a', status: 'running' } as never];
+  await f.clock.advance(52 * MIN);
+  expect(stored(f).map(e => e.reason)).toEqual(['agents']);
+  f.world.agents = [];
+  await $.session.start(DESKTOP);
+  await f.clock.advance(MIN);
+  expect(f.commands).toEqual([]);
+});
+
+test('a headless run keeps no request in the state', async ($, on) => {
+  const f = fixture(on, { surfaces: [] });
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  expect(f.state.has('request')).toBe(false);
+});
+
+test('a reload long after the kept request arms nothing: the cache is cold', async ($, on) => {
+  const f = fixture(on, { state: { drawn: { sessionId: 'test-session' }, request: { sessionId: 'test-session', at: NOW - 2 * HOUR, ended: true } } });
+  await $.session.start(DESKTOP);
+  await f.clock.advance(3 * HOUR);
+  expect(f.commands).toEqual([]);
+  expect(stored(f)).toEqual([]);
+});
+
+test('each request and the end of its turn are kept in the state, and /clear forgets them', async ($, on) => {
+  const f = fixture(on);
+  await $.session.start(DESKTOP);
+  await $.turn.start({ turnId: 't', text: 'hello' });
+  await f.clock.advance(MIN);
+  for await (const _ of $.turn.step({ turnId: 't', index: 0, model: 'test', messageCount: 1 })) { /* drain */ }
+  expect(f.state.get('request')).toEqual({ sessionId: 'test-session', at: NOW + MIN, ended: false });
+  await $.turn.complete({ turnId: 't', answer: 'ok', durationMs: 1, isAborted: false, reason: 'answer' });
+  expect(f.state.get('request')).toEqual({ sessionId: 'test-session', at: NOW + MIN, ended: true });
+  await $.turn.start({ turnId: 'u', text: 'again' });
+  expect(f.state.get('request')).toEqual({ sessionId: 'test-session', at: NOW + MIN, ended: false });
+  await $.session.end({ reason: 'clear', sessionId: 'test-session', resume: { sessionId: 'test-session' } } as never);
+  expect(f.state.get('request')).toBeNull();
+});
+
+// A timer in the state long past its time was dropped (a fired one clears it):
+// the module was replaced and its start did not arm it again.
+test('a timer that never fired is noted at the next turn', async ($, on) => {
+  const due = NOW - HOUR;
+  const f = fixture(on, { surfaces: [], state: { armed: { sessionId: 'test-session', lastRequestAt: due - 52 * MIN } } });
+  await turn($, f.clock);
+  const log = stored(f);
+  // Kept though this module has seen no surface; the turn's end, headless here, is noted apart.
+  expect(log.map(e => e.outcome)).toEqual(['noted', 'noted']);
+  expect(log[0]?.reason).toMatch(/^turn\.start: the timer due at \S+ was still armed, it never fired or stopped early$/);
+  expect(log[1]?.reason).toBe('arm: no surface has drawn the session');
+});
+
+test('a timer that fired, or is not yet due, is not noted at the next turn', async ($, on) => {
+  const f = fixture(on);
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  await f.clock.advance(51 * MIN);
+  await turn($, f.clock);
+  await f.clock.advance(52 * MIN);
+  await compactTurn($, f);
+  await turn($, f.clock);
   expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['compacted', 'idle']]);
 });
 
@@ -423,7 +633,7 @@ test('a mark of another session does not make a headless run drawn', async ($, o
   await turn($, f.clock);
   await f.clock.advance(120 * MIN);
   expect(f.commands).toEqual([]);
-  expect(stored(f)).toEqual([]);
+  expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['noted', 'arm: no surface has drawn the session']]);
 });
 
 test('status and now answer in Russian when configured', RU, async ($, on) => {
@@ -446,7 +656,7 @@ test('the desktop text command is answered locally', async ($, on) => {
   on('prompt.submit', ($, e) => ({ text: e.text }));
   await $.session.start(DESKTOP);
   const reply = await $.prompt.submit({ text: '/warm-compact status', origin: { kind: 'composer' } } as never);
-  expect((reply as { drop?: string }).drop).toContain('warm-compact 0.2.4');
+  expect((reply as { drop?: string }).drop).toContain('warm-compact 0.2.6');
 });
 
 test('a turn of the person before the queued /compact skips it and arms again', async ($, on) => {

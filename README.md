@@ -62,6 +62,10 @@ the mod on their own; in a session that is already open, send
 - **Cancelling.** Any new turn, `/clear`, or a compaction done by someone else
   cancels the timer.
 - **Reload.** A plugin reload arms the timer again for the time that is left.
+  The main loop's last request is kept in the session state too, so a reload
+  that lands as a turn ends (the desktop app reloads every session when any
+  plugin is installed, and holds the reload until the turn ends) still arms
+  from it.
 - **Two ways to compact.** In the desktop app (an SDK session) the direct call
   is refused, so the mod runs `/compact` as a queued command. In a terminal it
   calls the compaction directly.
@@ -139,11 +143,16 @@ under the key `log`:
 A record with `outcome: "noted"` marks a quiet exit that left the session
 without a timer where one was expected: a turn of the main loop that started
 before the previous one ended, a turn that ended without arming the timer, a
-timer that found a turn or another compaction under way. These go to the store
-alone, with no line in the transcript, and the same one is kept once until a
-timer is armed again. The
-expected exits are not recorded: a context under `minTokens`, the mod off in
-the session, a headless run, a turn with no model request.
+timer that found a turn or another compaction under way. With a context of
+`minTokens` or more it also marks a turn end in a session no surface has drawn
+(a headless run, or a hidden session taken for one), a turn end with no model
+request seen since the module loaded, a reload that found no timer to pick
+up, and a timer that never fired (seen at the next turn: a plugin reload can
+drop it). A context that reads under `minTokens` while the last request read
+more is noted too. These go to the store alone, with no line in the
+transcript; the same one is kept once until a timer is armed again, and not
+twice in a row for a session. The expected exits are not recorded: a context
+under `minTokens`, the mod off in the session.
 
 ## Built-in idle compaction
 
