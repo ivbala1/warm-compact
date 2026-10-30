@@ -1,5 +1,5 @@
 import type { EngineInterface, Register, SessionCompacted, SessionCompactResult, SessionRateLimit, Timer } from 'claude-code';
-import { cachePercent, clockTime, instructions, settings, t, tokens, type Config, type MessageKey } from './text.ts';
+import { cachePercent, clockTime, instructions, questionLine, questionNote, settings, t, tokens, type Config, type MessageKey } from './text.ts';
 
 // A one-hour prompt cache lapses an hour after the last request that read or
 // wrote it. The main loop's last model request starts the count; when the
@@ -7,7 +7,7 @@ import { cachePercent, clockTime, instructions, settings, t, tokens, type Config
 // mod compacts it while the cache is still warm, so the summary reads the
 // conversation at the cache price and the next return starts small.
 
-const VERSION = '0.2.6';
+const VERSION = '0.2.7';
 const ARMED = { plugin: 'warm-compact', key: 'armed' } as const;
 const DRAWN = { plugin: 'warm-compact', key: 'drawn' } as const;
 const REQUEST = { plugin: 'warm-compact', key: 'request' } as const;
@@ -51,10 +51,33 @@ type Compacting = {
   since: number;
   // The instructions this mod sent: they tell its own /compact from someone else's.
   note: string;
+  // The removed cards' questions the note carries.
+  question?: string;
   // Set when the main loop sent a request or someone else compacted after the
   // mod queued /compact: the queued command then has nothing left to do.
   overtaken?: string;
 };
+
+// The AskUserQuestion cards a turn of the main loop waits on: the turn stays open
+// until each is answered, so its end never arms the timer; the watch removes them.
+type Watch = {
+  turnId: string;
+  sessionId: string;
+  // The request that put the cards up: the cache's hour counts from it.
+  since: number;
+  shownAt: number;
+  removeAt: number;
+  // The cards still unanswered, by tool_use_id: each one's questions.
+  cards: Map<string, readonly unknown[]>;
+  timer?: Timer;
+};
+
+// A card stays up at least this long: one that went up late, behind a long tool
+// of the same answer, does not vanish at once.
+const CARD_MIN_MS = 5 * 60_000;
+// A card is removed at least this long before the cutoff: the compaction its
+// removal starts must begin before the cutoff, which skips it as late.
+const CARD_MARGIN_MS = 60_000;
 
 let cfg: Config = settings();
 const say = (key: MessageKey, vars?: Record<string, string | number>) => t(cfg, key, vars);
@@ -89,6 +112,16 @@ let appending: Promise<unknown> = Promise.resolve();
 // Whether `$.session.compact()` works here: unknown in a terminal, false in an
 // SDK session (the desktop app), which compacts only inside a /compact turn.
 let direct: boolean | undefined;
+// The cards watched now, and the model's other tool calls of the main loop still
+// running (tool_use_id → turn): ending the turn would stop them too.
+let watch: Watch | undefined;
+const running = new Map<string, string | undefined>();
+// The model's cards not watched when they went up (tool_use_id → questions): a
+// session first drawn later, when a client joins, watches them then.
+const unwatched = new Map<string, unknown>();
+// The questions of the cards removed, for the summary: kept until a compaction
+// that carried them succeeds, a model request moves the conversation on, or the session ends.
+let openQuestion: string | undefined;
 
 function disarm() {
   generation += 1;
@@ -105,11 +138,24 @@ function forget($: EngineInterface) {
 /** Reads whether a surface draws the session now, and keeps the first yes in $.state. */
 async function lookDrawn($: EngineInterface) {
   if ((await $.session.surfaces()).length === 0 || drawn) return;
+  await markDrawn($);
+}
+
+/**
+ * Marks the session drawn and keeps the mark in $.state, with the last request
+ * seen while it was hidden; true when it was not drawn before.
+ */
+async function markDrawn($: EngineInterface) {
+  if (drawn) return false;
   drawn = true;
   // A failed write costs only a reload while hidden: the timer is armed all the same.
   try {
     await $.state.set(DRAWN, { sessionId: await $.session.id() });
   } catch {}
+  // Requests seen while hidden were not kept. The last one is kept now, as ended only
+  // where this module saw its turn end: one loaded mid-turn has no currentTurn.
+  if (lastRequestAt !== undefined) await keepRequest($, lastRequestAt, !working && currentTurn !== undefined);
+  return true;
 }
 
 /**
@@ -250,6 +296,8 @@ async function finish($: EngineInterface, c: Compacting, result: SessionCompactR
   }
   const now = await $.clock.now();
   if (result && result.skip === undefined) {
+    // The summary holds the open questions now.
+    if (c.question !== undefined && openQuestion === c.question) openQuestion = undefined;
     const share = cachePercent(result.usage);
     const before = result.tokensBefore ?? c.tokensBefore;
     const file = await saveSummary($, c, now, result);
@@ -354,8 +402,10 @@ async function fire($: EngineInterface, token: number, sessionId: string, since:
     return;
   }
   const idleMinutes = Math.round((now - since) / 60_000);
-  const note = instructions(cfg, clockTime(now), idleMinutes, manual);
-  const attempt: Compacting = { token, sessionId, startedAt: now, idleMinutes, tokensBefore: size, manual, since, note };
+  // Cards removed for this compaction: their questions go into the summary.
+  const question = openQuestion;
+  const note = instructions(cfg, clockTime(now), idleMinutes, manual, question);
+  const attempt: Compacting = { token, sessionId, startedAt: now, idleMinutes, tokensBefore: size, manual, since, note, question };
   compacting = attempt;
   timer = undefined;
   dueAt = undefined;
@@ -421,15 +471,104 @@ function watchTurn($: EngineInterface, turnId: string) {
   if (!drawn) return;
   turnWatch = $.clock.after(cfg.idleMs, () => {
     void (async () => {
-      if (!working || currentTurn !== turnId || lastRequestAt === undefined) return;
+      // A turn waiting on watched cards is the watch's: it ends the turn or notes why not.
+      const owned = () => watch?.turnId === turnId;
+      if (!working || currentTurn !== turnId || lastRequestAt === undefined || owned()) return;
       // Where no timer would be due (off, a small context) the long turn is no news.
       const sessionId = await $.session.id();
       if (await isOff($, sessionId)) return;
       const { context } = await $.session.usage();
       if ((context.tokens ?? 0) < cfg.minTokens) return;
-      if (working && currentTurn === turnId) await quiet($, `turn: a turn of the main loop has not ended after ${cfg.idleMs / 60_000} min`, { sessionId, tokensBefore: context.tokens });
+      if (working && currentTurn === turnId && !owned()) await quiet($, `turn: a turn of the main loop has not ended after ${cfg.idleMs / 60_000} min`, { sessionId, tokensBefore: context.tokens });
     })().catch(() => {});
   });
+}
+
+/**
+ * A card of the main loop's running turn: watched when the session would be
+ * compacted, so the turn's cards are removed unanswered at the idle time.
+ * `still` says whether the card is still up: one watched late, when a client
+ * joins, may be answered while the watch reads.
+ */
+async function watchCard($: EngineInterface, id: string, questions: unknown, still: () => boolean = () => true): Promise<Watch | undefined> {
+  const turnId = currentTurn;
+  const since = lastRequestAt;
+  if (!working || turnId === undefined || since === undefined) return undefined;
+  await lookDrawn($);
+  if (!drawn) return undefined;
+  // Where no timer would be due (off, a small context) the card waits as it did.
+  const sessionId = await $.session.id();
+  if (await isOff($, sessionId)) return undefined;
+  const { context } = await $.session.usage();
+  if ((context.tokens ?? 0) < cfg.minTokens) return undefined;
+  const now = await $.clock.now();
+  // The reads took time: the turn may have been interrupted meanwhile, or the
+  // card answered and the next request sent.
+  if (!working || currentTurn !== turnId || lastRequestAt !== since || !still()) return undefined;
+  // The request that put the card up started the cache's hour; a card that went
+  // up late still stays its minimum. Removed less than the margin before the
+  // cutoff, its compaction could start past it and be skipped.
+  const same = watch !== undefined && watch.turnId === turnId && watch.since === since ? watch : undefined;
+  const removeAt = Math.max(since + cfg.idleMs, now + CARD_MIN_MS, same?.removeAt ?? 0);
+  if (removeAt - since > cfg.cutoffMs - CARD_MARGIN_MS) return undefined;
+  let w = same;
+  if (!w) {
+    watch?.timer?.cancel();
+    w = watch = { turnId, sessionId, since, shownAt: now, removeAt: 0, cards: new Map() };
+  }
+  w.cards.set(id, Array.isArray(questions) ? questions : []);
+  if (removeAt !== w.removeAt) {
+    const mine = w;
+    mine.timer?.cancel();
+    mine.removeAt = removeAt;
+    mine.timer = $.clock.after(removeAt - now, () => {
+      void removeCards($, mine).catch(err => quiet($, `card: ${errorText(err)}`, { sessionId }));
+    });
+    try {
+      $.ui.log(say('cardNotice', { time: clockTime(removeAt) }));
+    } catch {}
+  }
+  return w;
+}
+
+/**
+ * The watch's timer: ends the turn that waits on the cards, with the gates `fire`
+ * has, so the turn end compacts the session while the cache is warm.
+ */
+async function removeCards($: EngineInterface, w: Watch) {
+  const token = generation;
+  // Every card answered, or a turn that ended or was overtaken: nothing to remove.
+  const up = () => watch === w && w.cards.size > 0 && working && currentTurn === w.turnId;
+  if (!up()) return;
+  const sessionId = await $.session.id();
+  if (sessionId !== w.sessionId || (await isOff($, sessionId))) return;
+  const { context, rateLimits } = await $.session.usage();
+  const size = context.tokens;
+  if ((size ?? 0) < cfg.minTokens) return;
+  const busy = (await $.agent.list()).filter(a => BUSY_AGENTS.includes(a.status));
+  // Read last: the reads above took time, and nothing below waits until the abort.
+  const now = await $.clock.now();
+  if (token !== generation || !up()) return;
+  // Cards left up are noted: the turn, and the timer with it, waits on the answers.
+  const keep = (reason: string) => quiet($, `card: ${reason}`, { sessionId, tokensBefore: size });
+  if (now - w.since > cfg.cutoffMs - CARD_MARGIN_MS) return keep('late: the cache went cold while waiting');
+  const limit = usedUp(rateLimits, now);
+  if (limit) return keep(`the ${limit.kind} usage limit is used up`);
+  if (busy.length) return keep(`${busy.length} agent(s) still running`);
+  // Ending the turn stops every tool it runs, not the cards alone.
+  if ([...running.values()].includes(w.turnId)) return keep('another tool of the turn is still running');
+  const questions = [...w.cards.values()].flat();
+  // Kept for the note: the turn end arms the timer, already due, and `fire` compacts.
+  openQuestion = questionNote(cfg, questions);
+  try {
+    await $.turn.abort({ turnId: w.turnId });
+  } catch (err) {
+    openQuestion = undefined;
+    return keep(`the turn was not ended: ${errorText(err)}`);
+  }
+  // A /clear meanwhile: the line would land in the next conversation.
+  if ((await $.session.id().catch(() => undefined)) !== w.sessionId) return;
+  $.ui.log(say('cardRemoved', { idle: Math.round((now - w.shownAt) / 60_000), question: questionLine(questions) }));
 }
 
 function schedule($: EngineInterface, sessionId: string, since: number, now: number) {
@@ -490,6 +629,49 @@ async function arm($: EngineInterface) {
   }
 }
 
+/**
+ * A client joined a session not drawn before: hidden at its start, at each turn's
+ * end and at each card, it was left alone as a headless run. What those left undone
+ * is done now: the turn's open cards are watched, an idle main loop is armed. A
+ * later join, the session drawn by then, only watches cards still left unwatched.
+ */
+async function catchUp($: EngineInterface) {
+  if (working) {
+    for (const [id, questions] of [...unwatched]) {
+      // Answered while an earlier card was read: nothing to watch.
+      if (!unwatched.has(id)) continue;
+      const w = await watchCard($, id, questions, () => unwatched.has(id)).catch(() => undefined);
+      if (!w) continue;
+      // Nothing is awaited between the watch's last look (`still`) and its keeping the
+      // card: one answered after that look is dropped by its own tool.call's finally.
+      // Gone from `unwatched` otherwise, it was claimed by another join's catch-up.
+      if (unwatched.delete(id)) running.delete(id);
+    }
+    return;
+  }
+  const since = lastRequestAt;
+  // `timer` is the idle timer or the one /warm-compact now set: either owns the
+  // session, as does a compaction under way or a turn.
+  const idle = () => !working && lastRequestAt === since && timer === undefined && compacting === undefined;
+  // A request seen without its turn's start: the module loaded mid-turn, and the turn may run still.
+  if (since === undefined || currentTurn === undefined || !idle()) return;
+  // Past the cutoff the cache is cold: the timer would only skip the session as late.
+  const now = await $.clock.now();
+  // Looked at again after the read: a turn may have started meanwhile. Nothing is
+  // awaited from here until arm, whose own token covers what comes after.
+  if (!idle() || now - since > cfg.cutoffMs) return;
+  await arm($);
+}
+
+/** A card's call ended, answered or with its turn: with no card left, the watch has nothing to remove. */
+function dropCard(id: string) {
+  const w = watch;
+  if (w?.cards.delete(id) && w.cards.size === 0) {
+    w.timer?.cancel();
+    watch = undefined;
+  }
+}
+
 /** After a reload: arms again for what is left since this session's last request. */
 async function rearm($: EngineInterface) {
   disarm();
@@ -540,6 +722,8 @@ async function statusText($: EngineInterface) {
   let armed: string;
   if (off) armed = say('notArmed', { why: say('offHere') });
   else if (compacting && now - compacting.startedAt < STALE_MS) armed = say('compactingNow');
+  // Cards left up past their time (noted why) wait as any running turn does.
+  else if (watch && working && currentTurn === watch.turnId && now < watch.removeAt) armed = say('cardPending', { time: clockTime(watch.removeAt) });
   else if (working) armed = say('working');
   else if (dueAt !== undefined) {
     const { context } = await $.session.usage();
@@ -626,6 +810,22 @@ export const register: Register = (on, options) => {
     return result;
   });
 
+  // The roster is read at a start, a turn's end and a card alone: a desktop session
+  // shown only in between, hidden at each of them, stayed a headless run with no
+  // timer and no watch. A client joining marks it drawn and catches up.
+  on('session.attach', async ($, e, next) => {
+    const result = await next(e);
+    try {
+      const fresh = await markDrawn($);
+      // Drawn already: another card may have read the roster first, and left the
+      // cards that went up before it unwatched.
+      if (fresh || (working && unwatched.size > 0)) await catchUp($);
+    } catch (err) {
+      await quiet($, `session.attach: ${errorText(err)}`);
+    }
+    return result;
+  });
+
   on('command.run', { command: 'warm-compact' }, ($, e) => control($, e.args));
 
   on('prompt.submit', async ($, e, next) => {
@@ -655,6 +855,8 @@ export const register: Register = (on, options) => {
       }
       // The main loop is busy again: a /compact still queued has nothing to do.
       if (compacting && !compacting.overtaken) compacting.overtaken = 'a turn ran first';
+      // The conversation moved on, the questions with it: the user may have answered them.
+      openQuestion = undefined;
     }
     const result = yield* next(e);
     const u = result?.usage;
@@ -697,6 +899,7 @@ export const register: Register = (on, options) => {
       turnWatch?.cancel();
       turnWatch = undefined;
     }
+    currentTurn ??= e.turnId;
     // A turn that started meanwhile owns the state now.
     if (armed !== generation) {
       // Unless no turn started: then nothing will arm the timer, and a turn seems to run on.
@@ -711,6 +914,26 @@ export const register: Register = (on, options) => {
     // Never let arming the timer break the turn.
     await arm($).catch(err => void quiet($, `arm or saving the timer failed: ${errorText(err)}`));
     return result;
+  });
+
+  // A card keeps the turn open until it is answered, so no turn end arms the timer.
+  // Removed unanswered at the idle time, it ends the turn: the turn end compacts.
+  // The model's own calls alone: another plugin's question is not the turn's.
+  on('tool.call', async ($, e, next) => {
+    if (e.agentId !== undefined || next.origin.plugin !== 'engine') return next(e);
+    const id = e.tool_use_id;
+    const card = e.tool === 'AskUserQuestion';
+    const w = card ? await watchCard($, id, e.questions).catch(() => undefined) : undefined;
+    if (!w) running.set(id, currentTurn);
+    if (card && !w) unwatched.set(id, e.questions);
+    try {
+      return await next(e);
+    } finally {
+      running.delete(id);
+      unwatched.delete(id);
+      // Watched when it went up or when a client joined: the watch lets it go.
+      dropCard(id);
+    }
   });
 
   on('session.compact', async ($, e, next) => {
@@ -750,6 +973,11 @@ export const register: Register = (on, options) => {
     turnWatch?.cancel();
     turnWatch = undefined;
     currentTurn = undefined;
+    watch?.timer?.cancel();
+    watch = undefined;
+    running.clear();
+    unwatched.clear();
+    openQuestion = undefined;
     drawn = false;
     reloaded = false;
     awaitingEnd = false;

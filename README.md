@@ -72,6 +72,21 @@ the mod on their own; in a session that is already open, send
 - **Your message wins.** If a turn runs or someone else compacts before the
   queued `/compact` starts, the mod drops its compaction: the cache is warm
   again or the context is small already.
+- **A question left unanswered.** A question card (`AskUserQuestion`) keeps
+  the turn open until you answer it, so no turn end starts the count. When
+  the model puts one up, a line in the session shows the time it will be
+  removed; if it is still unanswered then, the mod removes it and compacts,
+  with the same checks as above. A card stays up at least 5 minutes: one that
+  appears late, behind a long tool of the same answer, is removed 5 minutes
+  after it appeared, or not watched at all when that leaves less than a minute
+  before `cutoffMinutes`, since the compaction must start before it.
+  While another tool of the same turn still runs, the card stays, since ending
+  the turn would stop that tool too. The question goes into the summary in
+  full (header, options with their descriptions, one or several answers) as
+  an open question, and into a line in the session: answer it in a message.
+  To the model, the removed card reads as a tool call that did not complete.
+  A card answered in time is left as it was, and so is a question another
+  plugin asks.
 
 ### The summary
 
@@ -143,7 +158,9 @@ under the key `log`:
 A record with `outcome: "noted"` marks a quiet exit that left the session
 without a timer where one was expected: a turn of the main loop that started
 before the previous one ended, a turn that ended without arming the timer, a
-timer that found a turn or another compaction under way. With a context of
+timer that found a turn or another compaction under way, a question card left
+up at its time (the cache was cold, a used-up limit, running agents, another
+tool of the turn still running, or the turn could not be ended). With a context of
 `minTokens` or more it also marks a turn end in a session no surface has drawn
 (a headless run, or a hidden session taken for one), a turn end with no model
 request seen since the module loaded, a reload that found no timer to pick
@@ -168,13 +185,21 @@ both may run. If you want only this mod, set `"idleCompaction": false`.
   perfect: details not written into the note may be lost, as with any
   compaction.
 - A session is compacted only after some surface has shown it once: a run
-  that never drew is taken for a headless one. A hidden session keeps the
-  mark through a plugin reload, but not through a restart of the app; it
-  is compacted again once you open it.
+  that never drew is taken for a headless one. Opening it at any moment
+  counts, and what was left while it was hidden catches up then: the timer
+  for the time left, the watch on an open card. Opened after `idleMinutes`
+  but before `cutoffMinutes`, it is compacted at once. A hidden session
+  keeps the mark through a plugin reload, but not through a restart of the
+  app or a new conversation in it; it is compacted again once you open it.
+  A plugin reload forgets the last request of a session never shown: opened
+  after the reload, it is compacted only after its next turn.
+- Only a question card of the main loop is removed, not one a subagent asks.
+  A plugin reload while a card is open drops its watch: that card waits for
+  your answer, as it did before 0.2.7.
 
 ## Development
 
-Tested on Claude Code 2.1.308.
+Tested on Claude Code 2.1.308, 2.1.309 and 2.1.312.
 
 ```
 claude plugin validate --strict .
